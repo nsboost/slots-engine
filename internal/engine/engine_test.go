@@ -95,3 +95,53 @@ func TestRTPRoughlyInBand(t *testing.T) {
 		t.Fatalf("RTP %.2f%% is far outside sane bounds — check for a paytable/reel regression", rtp)
 	}
 }
+
+// TestAllGamesValidateAndStayInRTPBand covers every registered game, so a
+// new game or a paytable edit that breaks the math is caught by `go test`.
+// The band is deliberately tighter than the demo guard above (90-100%):
+// both shipped games target 94-96%. cmd/simulate remains the tool for real
+// tuning; this is the regression tripwire.
+func TestAllGamesValidateAndStayInRTPBand(t *testing.T) {
+	seen := map[string]bool{}
+	for _, cfg := range AllGames() {
+		if seen[cfg.ID] {
+			t.Fatalf("duplicate game id %q", cfg.ID)
+		}
+		seen[cfg.ID] = true
+
+		eng, err := New(cfg)
+		if err != nil {
+			t.Fatalf("%s failed validation: %v", cfg.ID, err)
+		}
+		lines := len(cfg.Paylines)
+		var bet, win int64
+		const spins = 600_000
+		for i := 0; i < spins; i++ {
+			res, err := eng.Spin(SpinRequest{BetPerLine: 1, LinesPlayed: lines})
+			if err != nil {
+				t.Fatalf("%s spin: %v", cfg.ID, err)
+			}
+			if res.GameID != cfg.ID {
+				t.Fatalf("%s: result carries wrong game id %q", cfg.ID, res.GameID)
+			}
+			bet += res.TotalBet
+			win += res.TotalWin
+		}
+		rtp := float64(win) / float64(bet) * 100
+		if rtp < 90 || rtp > 100 {
+			t.Fatalf("%s: RTP %.2f%% outside the 90-100%% tripwire band", cfg.ID, rtp)
+		}
+	}
+}
+
+func TestBetLimitsEnforced(t *testing.T) {
+	eng, _ := New(DemoFortuneReels())
+	for _, bet := range []int64{0, -1, MaxBetPerLine + 1} {
+		if _, err := eng.Spin(SpinRequest{BetPerLine: bet, LinesPlayed: 1}); err == nil {
+			t.Fatalf("bet %d should be rejected", bet)
+		}
+	}
+	if _, err := eng.Spin(SpinRequest{BetPerLine: MaxBetPerLine, LinesPlayed: 1}); err != nil {
+		t.Fatalf("max bet should be accepted: %v", err)
+	}
+}

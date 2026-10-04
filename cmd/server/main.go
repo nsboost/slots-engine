@@ -1,11 +1,19 @@
-// cmd/server runs the HTTP API locally. Storage backend is selected by
-// the LEDGER_DSN environment variable: unset or empty uses the in-memory
-// store (data lost on restart — fine for local dev and demos); set it to
-// a Postgres DSN to run durably. This is the ONE place backend choice is
-// decided, so swapping it is a config change, not a code change.
+// cmd/server runs the HTTP API (and optionally the web client).
+//
+// Configuration (environment variables):
+//
+//	LISTEN_ADDR   listen address (default :8080)
+//	LEDGER_DSN    Postgres DSN; unset = in-memory ledger (NOT durable)
+//	AUTH_SECRET   HMAC secret for guest tokens. Set a long random value in
+//	              any real deployment; if unset a random one is generated
+//	              and tokens stop working on restart.
+//	STATIC_DIR    directory containing the web client build to serve at /
+//	TRUST_PROXY   "true" to trust X-Forwarded-For (only behind your own proxy)
+//	PLAYER_KEYS_JSON  optional dev-only static keys: {"playerId":"key"}
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -18,9 +26,13 @@ import (
 )
 
 func main() {
-	eng, err := engine.New(engine.DemoFortuneReels())
-	if err != nil {
-		log.Fatalf("engine init failed: %v", err)
+	var engines []*engine.Engine
+	for _, cfg := range engine.AllGames() {
+		e, err := engine.New(cfg)
+		if err != nil {
+			log.Fatalf("engine init failed for %s: %v", cfg.ID, err)
+		}
+		engines = append(engines, e)
 	}
 
 	var store ledger.Store
@@ -37,33 +49,64 @@ func main() {
 		log.Println("ledger: using in-memory backend (NOT durable — set LEDGER_DSN for persistence)")
 	}
 
-	auth := api.NewStaticKeyAuthenticator(loadPlayerKeys())
-	rl := api.NewRateLimiter(60, time.Minute) // 60 requests/minute/player — generous for a slot game's click rate, tight enough to blunt a naive bot
+	secret := []byte(os.Getenv("AUTH_SECRET"))
+	if len(secret) == 0 {
+		secret = make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			log.Fatalf("failed to generate auth secret: %v", err)
+		}
+		log.Println("auth: AUTH_SECRET not set — generated a random one; guest tokens will NOT survive a restart")
+	} else if len(secret) < 16 {
+		log.Fatal("auth: AUTH_SECRET must be at least 16 bytes")
+	}
+	tokens := api.NewTokenAuthenticator(secret)
 
-	srv := api.NewServer(eng, store, auth, rl)
+	authn := api.ChainAuthenticator{tokens}
+	if keys := loadPlayerKeys(); len(keys) > 0 {
+		authn = append(authn, api.NewStaticKeyAuthenticator(keys))
+		log.Printf("auth: %d dev static key(s) enabled", len(keys))
+	}
+
+	api.SetTrustProxy(os.Getenv("TRUST_PROXY") == "true")
+
+	srv, err := api.NewServer(api.Config{
+		Engines:      engines,
+		Store:        store,
+		Auth:         authn,
+		Tokens:       tokens,
+		RateLimiter:  api.NewRateLimiter(240, time.Minute),
+		GuestLimiter: api.NewRateLimiter(30, time.Hour),
+		StaticDir:    os.Getenv("STATIC_DIR"),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
 		addr = ":8080"
 	}
+	if d := os.Getenv("STATIC_DIR"); d != "" {
+		log.Printf("serving web client from %s", d)
+	}
+	log.Printf("listening on %s (platform version %s, %d games)", addr, engine.GameVersion, len(engines))
 
-	log.Printf("listening on %s (game version %s)", addr, engine.GameVersion)
-	if err := http.ListenAndServe(addr, api.LoggingMiddleware(srv.Mux)); err != nil {
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           api.SecurityHeaders(api.LoggingMiddleware(srv.Mux)),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := httpSrv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// loadPlayerKeys reads PLAYER_KEYS_JSON, a JSON object mapping playerID ->
-// API key, e.g. PLAYER_KEYS_JSON='{"alice":"dev-key-alice"}'. This is the
-// DEV-ONLY static-key auth store — see the doc comment on
-// StaticKeyAuthenticator for what MUST replace it before this is a real
-// deployment (session tokens from Apple/Google sign-in, issued and
-// verified server-side, not a shared secret set via env var).
 func loadPlayerKeys() map[string]string {
 	raw := os.Getenv("PLAYER_KEYS_JSON")
 	if raw == "" {
-		log.Println("auth: PLAYER_KEYS_JSON not set — no players will be able to authenticate")
-		return map[string]string{}
+		return nil
 	}
 	var keys map[string]string
 	if err := json.Unmarshal([]byte(raw), &keys); err != nil {

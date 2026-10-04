@@ -15,12 +15,17 @@ import (
 )
 
 func main() {
+	gameID := flag.String("game", "fortune-reels", "game id to simulate")
 	spins := flag.Int("spins", 2_000_000, "number of spins to simulate")
 	linesPlayed := flag.Int("lines", 9, "paylines played per spin")
 	betPerLine := flag.Int64("bet", 1, "bet per line, in coins")
 	flag.Parse()
 
-	cfg := engine.DemoFortuneReels()
+	cfg, ok := engine.GameByID(*gameID)
+	if !ok {
+		fmt.Println("unknown game:", *gameID)
+		return
+	}
 	eng, err := engine.New(cfg)
 	if err != nil {
 		fmt.Println("config error:", err)

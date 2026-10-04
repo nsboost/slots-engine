@@ -45,6 +45,7 @@ const (
 // Config bundles everything that defines a game's math. It is the unit
 // that gets versioned, simulated, and eventually certified.
 type Config struct {
+	ID          string // stable machine id used in API routes and client themes, e.g. "fortune-reels"
 	Name        string
 	Rows        int
 	Reels       [][]Symbol // Reels[col] = full strip for that column, in strip order
@@ -53,6 +54,13 @@ type Config struct {
 	WildSymbol  Symbol
 	ScatterPays ScatterPaytable
 }
+
+// Bet limits enforced by Spin. Clients offer a subset of these as bet
+// levels; the server is the authority on what is allowed.
+const (
+	MinBetPerLine int64 = 1
+	MaxBetPerLine int64 = 100
+)
 
 // Payline is a row index per reel column (left to right).
 type Payline []int
@@ -77,6 +85,7 @@ type SpinRequest struct {
 // SpinResult is the full, signed-off outcome of one spin. This is the
 // only thing a client is allowed to render.
 type SpinResult struct {
+	GameID      string
 	GameVersion string
 	Grid        [][]Symbol // Grid[col][row]
 	LineWins    []LineWin
@@ -106,7 +115,14 @@ func New(cfg Config) (*Engine, error) {
 	return &Engine{cfg: cfg}, nil
 }
 
+// Config returns the engine's immutable game definition (used by the API
+// to describe the game to clients: paylines, paytable, symbols).
+func (e *Engine) Config() Config { return e.cfg }
+
 func validateConfig(cfg Config) error {
+	if cfg.ID == "" {
+		return fmt.Errorf("game id required")
+	}
 	if cfg.Rows <= 0 {
 		return fmt.Errorf("rows must be > 0")
 	}
@@ -149,8 +165,8 @@ func (e *Engine) Spin(req SpinRequest) (SpinResult, error) {
 	if req.LinesPlayed <= 0 || req.LinesPlayed > len(e.cfg.Paylines) {
 		return SpinResult{}, fmt.Errorf("invalid lines played: %d", req.LinesPlayed)
 	}
-	if req.BetPerLine <= 0 {
-		return SpinResult{}, fmt.Errorf("bet per line must be > 0")
+	if req.BetPerLine < MinBetPerLine || req.BetPerLine > MaxBetPerLine {
+		return SpinResult{}, fmt.Errorf("bet per line must be between %d and %d", MinBetPerLine, MaxBetPerLine)
 	}
 
 	grid := make([][]Symbol, len(e.cfg.Reels))
@@ -169,6 +185,7 @@ func (e *Engine) Spin(req SpinRequest) (SpinResult, error) {
 	}
 
 	result := SpinResult{
+		GameID:      e.cfg.ID,
 		GameVersion: GameVersion,
 		Grid:        grid,
 		TotalBet:    req.BetPerLine * int64(req.LinesPlayed),

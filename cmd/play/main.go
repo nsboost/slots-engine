@@ -11,10 +11,15 @@ import (
 )
 
 func main() {
+	gameID := flag.String("game", "fortune-reels", "game id to play")
 	n := flag.Int("n", 5, "number of spins to print")
 	flag.Parse()
 
-	cfg := engine.DemoFortuneReels()
+	cfg, ok := engine.GameByID(*gameID)
+	if !ok {
+		fmt.Println("unknown game:", *gameID)
+		return
+	}
 	eng, err := engine.New(cfg)
 	if err != nil {
 		fmt.Println("config error:", err)

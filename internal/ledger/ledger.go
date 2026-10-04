@@ -185,3 +185,25 @@ func MintTransaction(txID, playerID string, amount int64, kind AccountKind, txTy
 	}
 	return tx, nil
 }
+
+// MintPackage creates the coins for a store package in one balanced
+// transaction: base coins into PLAYER_PURCHASED and any bonus coins into
+// PLAYER_BONUS, both offset against SYSTEM_MINT. In the real-money phase
+// this is only ever called from a verified payment-provider webhook.
+func MintPackage(txID, playerID string, coins, bonus int64, txType string) (Transaction, error) {
+	if coins <= 0 || bonus < 0 {
+		return Transaction{}, fmt.Errorf("ledger: invalid package amounts")
+	}
+	entries := []Entry{
+		{Account: Account{PlayerID: playerID, Kind: KindPlayerPurchased}, Amount: coins},
+	}
+	if bonus > 0 {
+		entries = append(entries, Entry{Account: Account{PlayerID: playerID, Kind: KindPlayerBonus}, Amount: bonus})
+	}
+	entries = append(entries, Entry{Account: Account{Kind: KindSystemMint}, Amount: -(coins + bonus)})
+	tx := Transaction{ID: txID, Type: txType, Entries: entries, Ref: playerID}
+	if err := tx.Validate(); err != nil {
+		return Transaction{}, err
+	}
+	return tx, nil
+}

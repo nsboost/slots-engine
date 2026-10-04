@@ -3,6 +3,7 @@ package api
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -91,7 +92,23 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// trustProxy controls whether X-Forwarded-For is believed when keying the
+// limiter by IP. Only enable (TRUST_PROXY=true) when the server sits behind
+// a proxy you control that overwrites that header — otherwise any client
+// could spoof it to dodge rate limits.
+var trustProxy bool
+
+func SetTrustProxy(v bool) { trustProxy = v }
+
 func clientIP(r *http.Request) string {
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			first := strings.TrimSpace(strings.Split(xff, ",")[0])
+			if first != "" {
+				return first
+			}
+		}
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

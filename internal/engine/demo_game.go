@@ -67,7 +67,8 @@ func DemoFortuneReels() Config {
 	}
 
 	return Config{
-		Name:        "Fortune Reels (demo)",
+		ID:          "fortune-reels",
+		Name:        "Fortune Reels",
 		Rows:        3,
 		Reels:       reels,
 		Paytable:    paytable,

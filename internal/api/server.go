@@ -1,18 +1,24 @@
 // Package api exposes the game engine and ledger over HTTP for a mobile
-// client. Everything here assumes an already-authenticated player
-// (auth middleware is a documented stub — see Server.authenticate — and
-// MUST be replaced before this ever leaves local dev).
+// or web client. Handlers are deliberately thin: validate input, call into
+// engine/ledger, serialize. All game logic and money logic lives in
+// internal/engine and internal/ledger so it stays unit-testable without
+// HTTP.
 //
-// Every handler here is deliberately dumb: validate input, call into
-// engine/ledger, serialize the result. All game logic and money logic
-// lives in internal/engine and internal/ledger so it stays unit-testable
-// without spinning up HTTP at all.
+// File layout:
+//
+//	server.go            Server, Config, routing, shared helpers
+//	handlers_spin.go     POST spin (idempotent, server-authoritative)
+//	handlers_catalog.go  games list, store packages, demo purchase
+//	handlers_account.go  guest registration, balance, history
+//	handlers_daily.go    daily bonus status/claim
+//	auth.go, token_auth.go, ratelimit.go, static.go  cross-cutting concerns
 package api
 
 import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"time"
@@ -21,252 +27,103 @@ import (
 	"slots-engine/internal/ledger"
 )
 
+// Config bundles everything NewServer needs.
+type Config struct {
+	Engines      []*engine.Engine // lobby order
+	Store        ledger.Store
+	Auth         Authenticator       // accepts requests (chain tokens + static keys)
+	Tokens       *TokenAuthenticator // issues guest tokens; nil disables guest registration
+	RateLimiter  *RateLimiter        // per-player limiter for protected routes
+	GuestLimiter *RateLimiter        // per-IP limiter for guest registration
+	StaticDir    string              // optional: serve a web client build from here at /
+	Now          func() time.Time    // injectable clock (daily bonus tests)
+}
+
 // Server holds the shared dependencies for all handlers.
 type Server struct {
-	Engine      *engine.Engine
-	Store       ledger.Store
-	Auth        Authenticator
-	RateLimiter *RateLimiter
-	Mux         *http.ServeMux
+	Engines      map[string]*engine.Engine
+	GameOrder    []string
+	Store        ledger.Store
+	Auth         Authenticator
+	Tokens       *TokenAuthenticator
+	RateLimiter  *RateLimiter
+	GuestLimiter *RateLimiter
+	Now          func() time.Time
+	Mux          *http.ServeMux
 }
 
-func NewServer(eng *engine.Engine, store ledger.Store, auth Authenticator, rl *RateLimiter) *Server {
-	s := &Server{Engine: eng, Store: store, Auth: auth, RateLimiter: rl, Mux: http.NewServeMux()}
-	s.routes()
-	return s
+func NewServer(cfg Config) (*Server, error) {
+	if len(cfg.Engines) == 0 {
+		return nil, errors.New("api: at least one game engine is required")
+	}
+	s := &Server{
+		Engines:      make(map[string]*engine.Engine),
+		Store:        cfg.Store,
+		Auth:         cfg.Auth,
+		Tokens:       cfg.Tokens,
+		RateLimiter:  cfg.RateLimiter,
+		GuestLimiter: cfg.GuestLimiter,
+		Now:          cfg.Now,
+		Mux:          http.NewServeMux(),
+	}
+	if s.Now == nil {
+		s.Now = time.Now
+	}
+	if s.RateLimiter == nil {
+		s.RateLimiter = NewRateLimiter(120, time.Minute)
+	}
+	if s.GuestLimiter == nil {
+		s.GuestLimiter = NewRateLimiter(20, time.Hour)
+	}
+	for _, e := range cfg.Engines {
+		id := e.Config().ID
+		s.Engines[id] = e
+		s.GameOrder = append(s.GameOrder, id)
+	}
+	s.routes(cfg.StaticDir)
+	return s, nil
 }
 
-func (s *Server) routes() {
-	// Go 1.22's ServeMux supports method + path-pattern matching natively,
-	// so no third-party router is needed — one less dependency to vet and
-	// keep updated, and one less thing to port if the backend language
-	// ever changes.
+func (s *Server) routes(staticDir string) {
+	// Go 1.22's ServeMux does method + path-pattern routing natively, so
+	// no router dependency is needed.
 	//
-	// Every player-scoped route is wrapped: RequireAuth runs first
-	// (rejects unauthenticated requests and cross-player access), THEN
-	// the rate limiter, so limiting happens per authenticated player ID
-	// rather than falling back to per-IP (which would let one player
-	// dodge the limit by rotating source ports/proxies).
+	// Player-scoped routes: RequireAuth first (401 for bad credentials,
+	// 403 for a valid credential used on another player's path), THEN the
+	// rate limiter so limiting is keyed by authenticated player.
 	protect := func(h http.HandlerFunc) http.Handler {
 		return RequireAuth(s.Auth, s.RateLimiter.Middleware(h))
 	}
 
+	s.Mux.HandleFunc("GET /v1/healthz", s.handleHealthz)
+	s.Mux.HandleFunc("GET /v1/games", s.handleGames)
+	s.Mux.HandleFunc("GET /v1/store/packages", s.handlePackages)
+	s.Mux.Handle("POST /v1/auth/guest", s.GuestLimiter.Middleware(http.HandlerFunc(s.handleGuest)))
+
 	s.Mux.Handle("POST /v1/players/{playerID}/spin", protect(s.handleSpin))
 	s.Mux.Handle("GET /v1/players/{playerID}/balance", protect(s.handleBalance))
-	s.Mux.Handle("POST /v1/players/{playerID}/demo-purchase", protect(s.handleDemoPurchase))
 	s.Mux.Handle("GET /v1/players/{playerID}/history", protect(s.handleHistory))
-	// Health check is intentionally unauthenticated and unlimited — load
-	// balancers and uptime monitors need to hit it freely.
-	s.Mux.HandleFunc("GET /v1/healthz", s.handleHealthz)
+	s.Mux.Handle("POST /v1/players/{playerID}/demo-purchase", protect(s.handleDemoPurchase))
+	s.Mux.Handle("GET /v1/players/{playerID}/daily-bonus", protect(s.handleDailyStatus))
+	s.Mux.Handle("POST /v1/players/{playerID}/daily-bonus", protect(s.handleDailyClaim))
+
+	if staticDir != "" {
+		s.Mux.Handle("GET /", StaticHandler(staticDir))
+	}
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "gameVersion": engine.GameVersion})
 }
 
-// spinRequestBody is the client-facing request shape. Note it carries NO
-// outcome data — only intent (how much to bet, how many lines). The
-// server computes everything else; see the engine package doc comment
-// for why that's non-negotiable.
-type spinRequestBody struct {
-	BetPerLine  int64 `json:"betPerLine"`
-	LinesPlayed int   `json:"linesPlayed"`
-	// IdempotencyKey lets a client safely retry a spin request that timed
-	// out without risking a double-charge. Required.
-	IdempotencyKey string `json:"idempotencyKey"`
+// decodeJSON reads a size-limited JSON body into v.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+	return json.NewDecoder(r.Body).Decode(v)
 }
 
-type spinResponseBody struct {
-	GameVersion      string            `json:"gameVersion"`
-	Grid             [][]engine.Symbol `json:"grid"`
-	LineWins         []engine.LineWin  `json:"lineWins"`
-	ScatterWin       int64             `json:"scatterWin"`
-	TotalWin         int64             `json:"totalWin"`
-	TotalBet         int64             `json:"totalBet"`
-	PurchasedBalance int64             `json:"purchasedBalance"`
-	BonusBalance     int64             `json:"bonusBalance"`
-	Replayed         bool              `json:"replayed"`
-}
-
-func (s *Server) handleSpin(w http.ResponseWriter, r *http.Request) {
-	playerID := r.PathValue("playerID")
-	if playerID == "" {
-		writeError(w, http.StatusBadRequest, "playerID required")
-		return
-	}
-
-	var body spinRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if body.IdempotencyKey == "" {
-		writeError(w, http.StatusBadRequest, "idempotencyKey required")
-		return
-	}
-
-	ctx := r.Context()
-
-	// Check idempotency FIRST, before touching the engine. This is what
-	// makes a retried request return the exact original spin (same grid,
-	// same wins) instead of a fresh roll tied to an already-settled bet —
-	// the engine's RNG is never consulted on a replay.
-	if existing, ok, err := s.Store.Get(ctx, body.IdempotencyKey); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to check idempotency")
-		return
-	} else if ok {
-		var cached spinResponseBody
-		if err := json.Unmarshal([]byte(existing.Payload), &cached); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to decode cached spin result")
-			return
-		}
-		balances, err := s.Store.Balances(ctx, playerID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to load balance")
-			return
-		}
-		cached.PurchasedBalance = balances[ledger.KindPlayerPurchased]
-		cached.BonusBalance = balances[ledger.KindPlayerBonus]
-		cached.Replayed = true
-		writeJSON(w, http.StatusOK, cached)
-		return
-	}
-
-	balances, err := s.Store.Balances(ctx, playerID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load balance")
-		return
-	}
-	available := balances[ledger.KindPlayerPurchased] + balances[ledger.KindPlayerBonus]
-	wantBet := body.BetPerLine * int64(body.LinesPlayed)
-	if wantBet <= 0 {
-		writeError(w, http.StatusBadRequest, "bet must be > 0")
-		return
-	}
-	if wantBet > available {
-		writeError(w, http.StatusPaymentRequired, "insufficient balance")
-		return
-	}
-
-	result, err := s.Engine.Spin(engine.SpinRequest{
-		SessionID:   playerID,
-		BetPerLine:  body.BetPerLine,
-		LinesPlayed: body.LinesPlayed,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	settlement, err := ledger.SpinSettlement(
-		body.IdempotencyKey, playerID, result.TotalBet, result.TotalWin, balances[ledger.KindPlayerPurchased],
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "settlement construction failed")
-		return
-	}
-
-	// Attach the spin outcome as the transaction payload so a future
-	// replay (handled above) returns this exact response body.
-	respBody := spinResponseBody{
-		GameVersion: result.GameVersion,
-		Grid:        result.Grid,
-		LineWins:    result.LineWins,
-		ScatterWin:  result.ScatterWin,
-		TotalWin:    result.TotalWin,
-		TotalBet:    result.TotalBet,
-	}
-	payload, err := json.Marshal(respBody)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to encode spin result")
-		return
-	}
-	settlement.Payload = string(payload)
-
-	applyResult, err := s.Store.Apply(ctx, settlement)
-	if err != nil {
-		if err == ledger.ErrInsufficientFunds {
-			writeError(w, http.StatusPaymentRequired, "insufficient balance")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to settle spin")
-		return
-	}
-
-	newBalances, err := s.Store.Balances(ctx, playerID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load updated balance")
-		return
-	}
-
-	respBody.PurchasedBalance = newBalances[ledger.KindPlayerPurchased]
-	respBody.BonusBalance = newBalances[ledger.KindPlayerBonus]
-	respBody.Replayed = applyResult.Replayed
-	writeJSON(w, http.StatusOK, respBody)
-}
-
-func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
-	playerID := r.PathValue("playerID")
-	balances, err := s.Store.Balances(r.Context(), playerID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load balance")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]int64{
-		"purchased": balances[ledger.KindPlayerPurchased],
-		"bonus":     balances[ledger.KindPlayerBonus],
-	})
-}
-
-type demoPurchaseBody struct {
-	Amount int64 `json:"amount"`
-}
-
-// handleDemoPurchase grants coins with NO real payment involved — this
-// endpoint must never exist in a build with real-money cash-out enabled.
-// When real payments are wired up, coin minting happens ONLY from a
-// verified payment-provider webhook handler, never from a
-// client-initiated request like this one.
-func (s *Server) handleDemoPurchase(w http.ResponseWriter, r *http.Request) {
-	playerID := r.PathValue("playerID")
-	var body demoPurchaseBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Amount <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid amount")
-		return
-	}
-
-	txID, err := newIdempotencyKey()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to generate transaction id")
-		return
-	}
-
-	tx, err := ledger.MintTransaction(txID, playerID, body.Amount, ledger.KindPlayerPurchased, "DEMO_PURCHASE")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "mint construction failed")
-		return
-	}
-	if _, err := s.Store.Apply(r.Context(), tx); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to apply purchase")
-		return
-	}
-
-	balances, _ := s.Store.Balances(r.Context(), playerID)
-	writeJSON(w, http.StatusOK, map[string]int64{"purchased": balances[ledger.KindPlayerPurchased]})
-}
-
-func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	playerID := r.PathValue("playerID")
-	hist, err := s.Store.History(r.Context(), playerID, 50)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load history")
-		return
-	}
-	writeJSON(w, http.StatusOK, hist)
-}
-
-func newIdempotencyKey() (string, error) {
-	b := make([]byte, 16)
+func randomHex(nBytes int) (string, error) {
+	b := make([]byte, nBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
@@ -285,13 +142,23 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// loggingMiddleware is a minimal request logger. Replace with structured
-// logging (and request IDs, and auth context) before this is anything
-// more than a local demo.
+// LoggingMiddleware is a minimal request logger. Replace with structured
+// logging and request IDs before production.
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
+// SecurityHeaders adds baseline hardening headers to every response.
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
 	})
 }
