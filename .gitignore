@@ -1,0 +1,23 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Local server binary used for smoke testing
+/server
+
+# Environment / secrets — never commit real DSNs, API keys, or certs
+.env
+.env.*
+*.pem
+*.key
+
+# IDE / OS cruft
+.vscode/
+.idea/
+.DS_Store
+
+# Go build cache if ever vendored locally
+/vendor/
