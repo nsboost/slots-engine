@@ -73,6 +73,14 @@ type Transaction struct {
 	Entries   []Entry
 	CreatedAt time.Time
 	Ref       string // free-form reference, e.g. spin ID
+	// Payload is an opaque, caller-defined blob (typically JSON) stored
+	// alongside the transaction and returned unchanged on a replayed
+	// Apply. This is what makes a replay fully idempotent end-to-end: the
+	// API layer stores the serialized SpinResult here so a retried spin
+	// request returns the EXACT original grid, not a freshly rolled one
+	// tied to an already-settled bet. The ledger package never inspects
+	// or interprets this field.
+	Payload string
 }
 
 var ErrUnbalanced = errors.New("ledger: transaction entries do not sum to zero")

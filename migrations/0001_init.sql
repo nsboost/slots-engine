@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     id          TEXT PRIMARY KEY,       -- caller-supplied idempotency key
     type        TEXT NOT NULL,
     ref         TEXT NOT NULL DEFAULT '',
+    payload     TEXT NOT NULL DEFAULT '', -- opaque caller blob (e.g. serialized SpinResult), returned verbatim on replay
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

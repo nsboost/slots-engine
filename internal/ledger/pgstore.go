@@ -65,8 +65,8 @@ func (s *PGStore) Apply(ctx context.Context, tx Transaction) (ApplyResult, error
 	}
 
 	if _, err := dbtx.ExecContext(ctx,
-		`INSERT INTO transactions (id, type, ref) VALUES ($1, $2, $3)`,
-		tx.ID, tx.Type, tx.Ref,
+		`INSERT INTO transactions (id, type, ref, payload) VALUES ($1, $2, $3, $4)`,
+		tx.ID, tx.Type, tx.Ref, tx.Payload,
 	); err != nil {
 		return ApplyResult{}, fmt.Errorf("ledger: insert transaction: %w", err)
 	}
@@ -170,7 +170,7 @@ func (s *PGStore) Balances(ctx context.Context, playerID string) (map[AccountKin
 
 func (s *PGStore) History(ctx context.Context, playerID string, limit int) ([]Transaction, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT DISTINCT t.id, t.type, t.ref, t.created_at
+		`SELECT DISTINCT t.id, t.type, t.ref, t.payload, t.created_at
 		 FROM transactions t JOIN entries e ON e.transaction_id = t.id
 		 WHERE e.player_id = $1
 		 ORDER BY t.created_at DESC
@@ -185,7 +185,7 @@ func (s *PGStore) History(ctx context.Context, playerID string, limit int) ([]Tr
 	var out []Transaction
 	for rows.Next() {
 		var tx Transaction
-		if err := rows.Scan(&tx.ID, &tx.Type, &tx.Ref, &tx.CreatedAt); err != nil {
+		if err := rows.Scan(&tx.ID, &tx.Type, &tx.Ref, &tx.Payload, &tx.CreatedAt); err != nil {
 			return nil, fmt.Errorf("ledger: scan history row: %w", err)
 		}
 		out = append(out, tx)
@@ -193,11 +193,45 @@ func (s *PGStore) History(ctx context.Context, playerID string, limit int) ([]Tr
 	return out, rows.Err()
 }
 
+// Get fetches a transaction (with its entries and payload) outside of any
+// in-progress Apply call. Used by the API layer to check idempotency
+// before doing expensive work like rolling a spin.
+func (s *PGStore) Get(ctx context.Context, txID string) (Transaction, bool, error) {
+	var tx Transaction
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, type, ref, payload, created_at FROM transactions WHERE id = $1`, txID,
+	).Scan(&tx.ID, &tx.Type, &tx.Ref, &tx.Payload, &tx.CreatedAt)
+	if err == sql.ErrNoRows {
+		return Transaction{}, false, nil
+	}
+	if err != nil {
+		return Transaction{}, false, fmt.Errorf("ledger: get transaction: %w", err)
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT player_id, account_kind, amount FROM entries WHERE transaction_id = $1`, txID,
+	)
+	if err != nil {
+		return Transaction{}, false, fmt.Errorf("ledger: get entries: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e Entry
+		var kind string
+		if err := rows.Scan(&e.Account.PlayerID, &kind, &e.Amount); err != nil {
+			return Transaction{}, false, fmt.Errorf("ledger: scan entry: %w", err)
+		}
+		e.Account.Kind = AccountKind(kind)
+		tx.Entries = append(tx.Entries, e)
+	}
+	return tx, true, rows.Err()
+}
+
 func (s *PGStore) fetchTransaction(ctx context.Context, dbtx *sql.Tx, id string) (Transaction, error) {
 	var tx Transaction
 	err := dbtx.QueryRowContext(ctx,
-		`SELECT id, type, ref, created_at FROM transactions WHERE id = $1`, id,
-	).Scan(&tx.ID, &tx.Type, &tx.Ref, &tx.CreatedAt)
+		`SELECT id, type, ref, payload, created_at FROM transactions WHERE id = $1`, id,
+	).Scan(&tx.ID, &tx.Type, &tx.Ref, &tx.Payload, &tx.CreatedAt)
 	if err != nil {
 		return Transaction{}, fmt.Errorf("ledger: fetch transaction: %w", err)
 	}

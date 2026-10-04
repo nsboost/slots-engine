@@ -23,13 +23,15 @@ import (
 
 // Server holds the shared dependencies for all handlers.
 type Server struct {
-	Engine *engine.Engine
-	Store  ledger.Store
-	Mux    *http.ServeMux
+	Engine      *engine.Engine
+	Store       ledger.Store
+	Auth        Authenticator
+	RateLimiter *RateLimiter
+	Mux         *http.ServeMux
 }
 
-func NewServer(eng *engine.Engine, store ledger.Store) *Server {
-	s := &Server{Engine: eng, Store: store, Mux: http.NewServeMux()}
+func NewServer(eng *engine.Engine, store ledger.Store, auth Authenticator, rl *RateLimiter) *Server {
+	s := &Server{Engine: eng, Store: store, Auth: auth, RateLimiter: rl, Mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
@@ -39,10 +41,22 @@ func (s *Server) routes() {
 	// so no third-party router is needed — one less dependency to vet and
 	// keep updated, and one less thing to port if the backend language
 	// ever changes.
-	s.Mux.HandleFunc("POST /v1/players/{playerID}/spin", s.handleSpin)
-	s.Mux.HandleFunc("GET /v1/players/{playerID}/balance", s.handleBalance)
-	s.Mux.HandleFunc("POST /v1/players/{playerID}/demo-purchase", s.handleDemoPurchase)
-	s.Mux.HandleFunc("GET /v1/players/{playerID}/history", s.handleHistory)
+	//
+	// Every player-scoped route is wrapped: RequireAuth runs first
+	// (rejects unauthenticated requests and cross-player access), THEN
+	// the rate limiter, so limiting happens per authenticated player ID
+	// rather than falling back to per-IP (which would let one player
+	// dodge the limit by rotating source ports/proxies).
+	protect := func(h http.HandlerFunc) http.Handler {
+		return RequireAuth(s.Auth, s.RateLimiter.Middleware(h))
+	}
+
+	s.Mux.Handle("POST /v1/players/{playerID}/spin", protect(s.handleSpin))
+	s.Mux.Handle("GET /v1/players/{playerID}/balance", protect(s.handleBalance))
+	s.Mux.Handle("POST /v1/players/{playerID}/demo-purchase", protect(s.handleDemoPurchase))
+	s.Mux.Handle("GET /v1/players/{playerID}/history", protect(s.handleHistory))
+	// Health check is intentionally unauthenticated and unlimited — load
+	// balancers and uptime monitors need to hit it freely.
 	s.Mux.HandleFunc("GET /v1/healthz", s.handleHealthz)
 }
 
@@ -93,6 +107,31 @@ func (s *Server) handleSpin(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Check idempotency FIRST, before touching the engine. This is what
+	// makes a retried request return the exact original spin (same grid,
+	// same wins) instead of a fresh roll tied to an already-settled bet —
+	// the engine's RNG is never consulted on a replay.
+	if existing, ok, err := s.Store.Get(ctx, body.IdempotencyKey); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check idempotency")
+		return
+	} else if ok {
+		var cached spinResponseBody
+		if err := json.Unmarshal([]byte(existing.Payload), &cached); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to decode cached spin result")
+			return
+		}
+		balances, err := s.Store.Balances(ctx, playerID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to load balance")
+			return
+		}
+		cached.PurchasedBalance = balances[ledger.KindPlayerPurchased]
+		cached.BonusBalance = balances[ledger.KindPlayerBonus]
+		cached.Replayed = true
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+
 	balances, err := s.Store.Balances(ctx, playerID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load balance")
@@ -109,14 +148,6 @@ func (s *Server) handleSpin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The spin outcome itself is NOT idempotent-replayable the same way
-	// the ledger write is: if this handler crashes after Spin() but
-	// before Apply(), a client retry with the same IdempotencyKey would
-	// get a fresh spin outcome tied to the same ledger entry it already
-	// has. For a production system, persist the SpinResult alongside the
-	// ledger transaction (same DB transaction) so a true replay returns
-	// the original grid too. Flagged here rather than silently shipped as
-	// "idempotent" when it is only partially so.
 	result, err := s.Engine.Spin(engine.SpinRequest{
 		SessionID:   playerID,
 		BetPerLine:  body.BetPerLine,
@@ -134,6 +165,24 @@ func (s *Server) handleSpin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "settlement construction failed")
 		return
 	}
+
+	// Attach the spin outcome as the transaction payload so a future
+	// replay (handled above) returns this exact response body.
+	respBody := spinResponseBody{
+		GameVersion: result.GameVersion,
+		Grid:        result.Grid,
+		LineWins:    result.LineWins,
+		ScatterWin:  result.ScatterWin,
+		TotalWin:    result.TotalWin,
+		TotalBet:    result.TotalBet,
+	}
+	payload, err := json.Marshal(respBody)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to encode spin result")
+		return
+	}
+	settlement.Payload = string(payload)
+
 	applyResult, err := s.Store.Apply(ctx, settlement)
 	if err != nil {
 		if err == ledger.ErrInsufficientFunds {
@@ -150,17 +199,10 @@ func (s *Server) handleSpin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, spinResponseBody{
-		GameVersion:      result.GameVersion,
-		Grid:             result.Grid,
-		LineWins:         result.LineWins,
-		ScatterWin:       result.ScatterWin,
-		TotalWin:         result.TotalWin,
-		TotalBet:         result.TotalBet,
-		PurchasedBalance: newBalances[ledger.KindPlayerPurchased],
-		BonusBalance:     newBalances[ledger.KindPlayerBonus],
-		Replayed:         applyResult.Replayed,
-	})
+	respBody.PurchasedBalance = newBalances[ledger.KindPlayerPurchased]
+	respBody.BonusBalance = newBalances[ledger.KindPlayerBonus]
+	respBody.Replayed = applyResult.Replayed
+	writeJSON(w, http.StatusOK, respBody)
 }
 
 func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {

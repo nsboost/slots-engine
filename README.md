@@ -14,7 +14,7 @@ arrangements.
 | Phase | What | Status |
 |---|---|---|
 | 1 | Slot math engine (reels, paytable, RTP) | ✅ Done — ~95.6-95.8% RTP verified at 10M simulated spins |
-| 2 | Double-entry ledger + HTTP API | ✅ Done — in-memory store for dev, Postgres store for durable deploys |
+| 2 | Double-entry ledger + HTTP API | ✅ Done — in-memory store for dev, Postgres store (integration-tested) for durable deploys; dev-grade auth and per-player rate limiting in place |
 | 3 | Mobile client (Godot) | Not started |
 | 4 | Real-money cash-out (requires gaming license) | Not started — **do not enable without legal sign-off** |
 
@@ -102,18 +102,53 @@ trusted in production — see the comment at the top of
 These are tracked here rather than left implicit, so nothing gets
 forgotten when picking this back up later:
 
-- **Auth is not implemented.** `internal/api` assumes an authenticated
-  player; there's no session/token verification yet.
-- **Spin-result replay is partial.** Ledger writes are idempotent (a
-  retried request never double-charges), but the spin *grid* returned on
-  a replay is freshly generated, not the original. Fix: persist the
-  `SpinResult` alongside its ledger transaction in the same DB write.
+- **Auth is dev-grade.** `StaticKeyAuthenticator` (a single static key per
+  player, sent as `X-Player-Key`) stands in for real session/token
+  verification. Replace with Apple/Google sign-in-issued, server-verified
+  session tokens before anything beyond closed demo testing. The
+  `Authenticator` interface and `RequireAuth` middleware are already
+  structured so this is a one-file swap, not a rewrite — and the
+  cross-player protection (a valid key for player A can't touch player
+  B's path) is already enforced regardless of which `Authenticator` is
+  plugged in.
+- **Rate limiting is per-process, in-memory.** Fine for a single server
+  instance; replace with a shared store (Redis `INCR`+`EXPIRE` is the
+  standard pattern) before running more than one instance behind a load
+  balancer, or each instance will enforce the limit independently.
 - **No payment processor integration.** The `demo-purchase` endpoint
   mints coins with no real money involved and must not exist in any
   build with real-money cash-out enabled.
 - **No KYC/age/geofencing.** Required before any real-money mode.
-- **No rate limiting / abuse protection** on the API.
-- **PGStore has no automated tests yet** — needs a real Postgres instance
-  (or test container) wired into CI.
+
+## Closed this session
+
+- **Spin-result replay is now fully idempotent.** The spin outcome
+  (`SpinResult`) is persisted as the ledger transaction's `Payload`, and
+  the API checks for an existing transaction *before* calling the engine.
+  A retried request now returns the exact original grid and wins, not a
+  freshly rolled outcome tied to an already-settled bet. Covered by
+  `TestSpinReplayReturnsIdenticalGrid` and
+  `TestSpinReplayDoesNotDoubleCharge` in `internal/api/server_test.go`.
+- **Auth and cross-player protection implemented** (`internal/api/auth.go`).
+  Every player-scoped route requires a valid `X-Player-Key` and rejects a
+  valid key used against a different player's path with 403 (distinct
+  from 401 for a missing/invalid key — this distinction matters for
+  monitoring: 403s are a potential attack signal, 401s usually aren't).
+- **Rate limiting implemented** (`internal/api/ratelimit.go`), keyed by
+  authenticated player ID, 60 req/min by default.
+- **PGStore now has a real integration test suite**, run against an
+  actual Postgres instance (`internal/ledger/pgstore_integration_test.go`,
+  build-tagged `integration` so it doesn't run without a database
+  configured). Covers mint/spend, idempotent replay with payload,
+  insufficient-funds rejection, and — importantly — 10 concurrent spins
+  against one balance to confirm the `SELECT ... FOR UPDATE` row locking
+  actually prevents lost updates. All four passed, including under `-race`.
+
+  Run it yourself with a scratch database:
+  ```bash
+  psql "$PGTEST_DSN" -f migrations/0001_init.sql
+  PGTEST_DSN="postgres://user:pass@localhost:5432/dbname?sslmode=disable" \
+    go test -tags=integration ./internal/ledger/... -run Postgres -v -race
+  ```
 
 See `/areas/slots-game.md` in project notes for the full phase plan.

@@ -13,6 +13,13 @@ type Store interface {
 	// because clients WILL retry requests on timeout.
 	Apply(ctx context.Context, tx Transaction) (ApplyResult, error)
 
+	// Get fetches a previously applied transaction by ID, including its
+	// Payload. Callers use this to check idempotency BEFORE doing
+	// expensive or stateful work (like rolling a spin) rather than
+	// discovering a replay only after. Returns ok=false if no transaction
+	// with that ID has been applied.
+	Get(ctx context.Context, txID string) (tx Transaction, ok bool, err error)
+
 	// Balance returns the current balance of one account. Returns 0 for an
 	// account that has never been touched (not an error).
 	Balance(ctx context.Context, acc Account) (int64, error)

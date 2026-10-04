@@ -74,6 +74,13 @@ func (s *MemStore) Apply(ctx context.Context, tx Transaction) (ApplyResult, erro
 	return ApplyResult{Transaction: tx, Replayed: false}, nil
 }
 
+func (s *MemStore) Get(ctx context.Context, txID string) (Transaction, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, ok := s.applied[txID]
+	return tx, ok, nil
+}
+
 func (s *MemStore) Balance(ctx context.Context, acc Account) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
