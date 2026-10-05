@@ -104,8 +104,15 @@ jobs:
             echo "No SLOTS_SERVER_URL secret — client will use same-origin"
           fi
 
-      - name: Copy PWA icons to deploy/web
+     - name: Copy PWA icons to deploy/web
         run: cp client/pwa/icon*.png deploy/web/
+
+      - name: Upload web build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: deploy/web
+          retention-days: 1
 
       - name: Add .nojekyll (stops GitHub Pages stripping files)
         run: touch deploy/web/.nojekyll
