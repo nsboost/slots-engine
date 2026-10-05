@@ -97,10 +97,10 @@ type SpinResult struct {
 
 // LineWin describes a single winning payline.
 type LineWin struct {
-	LineIndex int
-	Symbol    Symbol
-	Count     int
-	Win       int64
+	LineIndex int    `json:"lineIndex"`
+	Symbol    Symbol `json:"symbol"`
+	Count     int    `json:"count"`
+	Win       int64  `json:"win"`
 }
 
 // Engine runs spins against a fixed Config. One Engine per game.
