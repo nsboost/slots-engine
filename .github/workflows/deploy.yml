@@ -16,10 +16,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
-        with: { go-version: '1.22' }
-      - run: go vet ./...
-      - run: go test ./...
+        with:
+          go-version: "1.22"
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run go test
+        run: go test ./...
 
   build-web:
     name: Godot web export
@@ -27,6 +33,9 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Ensure export directory exists
+        run: mkdir -p deploy/web
 
       - name: Install Godot 4.4
         run: |
@@ -93,6 +102,9 @@ jobs:
       - name: Godot import + export
         run: bash scripts/build_web.sh
 
+      - name: Ensure deploy/web exists after export
+        run: mkdir -p deploy/web
+
       - name: Inject server URL into HTML
         env:
           SERVER_URL: ${{ secrets.SLOTS_SERVER_URL }}
@@ -105,7 +117,12 @@ jobs:
           fi
 
       - name: Copy PWA icons to deploy/web
-        run: cp client/pwa/icon*.png deploy/web/
+        run: |
+          if ls client/pwa/icon*.png >/dev/null 2>&1; then
+            cp client/pwa/icon*.png deploy/web/
+          else
+            echo "No PWA icons generated; skipping copy"
+          fi
 
       - name: Add .nojekyll (stops GitHub Pages stripping files)
         run: touch deploy/web/.nojekyll
@@ -115,6 +132,7 @@ jobs:
         with:
           name: web-build
           path: deploy/web
+          if-no-files-found: warn
           retention-days: 1
 
       - name: Deploy to GitHub Pages
@@ -132,11 +150,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Ensure deploy/web exists before Docker build
+        run: mkdir -p deploy/web
+
       - name: Download web build artifacts
         uses: actions/download-artifact@v4
         with:
           name: web-build
           path: deploy/web
+
+      - name: Show web build folder
+        run: |
+          echo "Contents of deploy/web:"
+          ls -la deploy/web || true
 
       - name: Build image
         run: docker build -t fortune-reels-server:${{ github.sha }} -f Dockerfile .
