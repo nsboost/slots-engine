@@ -26,7 +26,7 @@ COPY deploy/web/ /app/web/
 EXPOSE 8080
 
 ENV LISTEN_ADDR=:8080 \
-    STATIC_DIR=""
+    STATIC_DIR="" \
     AUTH_SECRET="" \
     LEDGER_DSN="" \
     TRUST_PROXY="true"
