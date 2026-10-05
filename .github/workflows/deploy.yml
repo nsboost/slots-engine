@@ -1,0 +1,134 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  test:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - run: go vet ./...
+      - run: go test ./...
+
+  build-web:
+    name: Godot web export
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Godot 4.4
+        run: |
+          wget -q https://github.com/godotengine/godot/releases/download/4.4-stable/Godot_v4.4-stable_linux.x86_64.zip
+          unzip -q Godot_v4.4-stable_linux.x86_64.zip
+          sudo mv Godot_v4.4-stable_linux.x86_64 /usr/local/bin/godot
+
+      - name: Install export templates (web only)
+        run: |
+          mkdir -p ~/.local/share/godot/export_templates/4.4.stable
+          python3 - << 'PY'
+          import urllib.request, zipfile, io, os
+          URL = "https://github.com/godotengine/godot/releases/download/4.4-stable/Godot_v4.4-stable_export_templates.tpz"
+          class RangeFile(io.RawIOBase):
+              def __init__(self, url):
+                  self.url = url; self.pos = 0
+                  req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
+                  with urllib.request.urlopen(req) as r:
+                      self.size = int(r.headers["Content-Range"].split("/")[1])
+              def seekable(self): return True
+              def readable(self): return True
+              def tell(self): return self.pos
+              def seek(self, off, whence=0):
+                  self.pos = off if whence==0 else self.pos+off if whence==1 else self.size+off; return self.pos
+              def read(self, n=-1):
+                  if n < 0: n = self.size - self.pos
+                  if n == 0 or self.pos >= self.size: return b""
+                  end = min(self.pos+n, self.size)-1
+                  req = urllib.request.Request(self.url, headers={"Range":f"bytes={self.pos}-{end}"})
+                  with urllib.request.urlopen(req) as r: data = r.read()
+                  self.pos += len(data); return data
+              def readinto(self, b):
+                  d = self.read(len(b)); b[:len(d)] = d; return len(d)
+          rf = RangeFile(URL)
+          zf = zipfile.ZipFile(io.BufferedReader(rf, buffer_size=1<<20))
+          out = os.path.expanduser("~/.local/share/godot/export_templates/4.4.stable")
+          for name in ["templates/version.txt","templates/web_nothreads_release.zip","templates/web_nothreads_debug.zip"]:
+              open(os.path.join(out, os.path.basename(name)),"wb").write(zf.read(name))
+              print("extracted", name)
+          PY
+
+      - name: Build PWA icons
+        run: |
+          pip install pillow -q
+          python3 - << 'PY'
+          from PIL import Image, ImageDraw, ImageFont
+          import glob
+          S = 1024
+          img = Image.new("RGBA",(S,S),(0,0,0,0))
+          d = ImageDraw.Draw(img)
+          for y in range(S):
+              t=y/S; c=(int(75-54*t),int(35-27*t),int(149-98*t),255); d.line([(0,y),(S,y)],fill=c)
+          mask=Image.new("L",(S,S),0); ImageDraw.Draw(mask).rounded_rectangle([0,0,S,S],radius=int(S*0.22),fill=255)
+          bg=Image.new("RGBA",(S,S),(0,0,0,0)); bg.paste(img,(0,0),mask); img=bg; d=ImageDraw.Draw(img)
+          cx=cy=S//2; R=int(S*0.33)
+          d.ellipse([cx-R,cy-R,cx+R,cy+R],fill=(217,141,16,255),outline=(255,243,176,255),width=int(S*0.025))
+          r2=int(R*0.78); d.ellipse([cx-r2,cy-r2,cx+r2,cy+r2],fill=(255,207,74,255),outline=(168,106,8,255),width=int(S*0.02))
+          fonts=glob.glob("/usr/share/fonts/**/DejaVuSerif-Bold.ttf",recursive=True) or glob.glob("/usr/share/fonts/**/*Bold*.ttf",recursive=True)
+          f=ImageFont.truetype(fonts[0],int(S*0.42)); d.text((cx,cy+S*0.01),"7",font=f,fill=(122,42,12,255),anchor="mm")
+          for s in (144,180,512): img.resize((s,s),Image.LANCZOS).save(f"client/pwa/icon{s}.png")
+          print("icons generated")
+          PY
+
+      - name: Godot import + export
+        run: bash scripts/build_web.sh
+
+      - name: Inject server URL into HTML
+        env:
+          SERVER_URL: ${{ secrets.SLOTS_SERVER_URL }}
+        run: |
+          if [ -n "$SERVER_URL" ]; then
+            sed -i "s|\$SERVER_URL|$SERVER_URL|g" deploy/web/index.html
+            echo "Server URL injected: $SERVER_URL"
+          else
+            echo "No SLOTS_SERVER_URL secret — client will use same-origin"
+          fi
+
+      - name: Copy PWA icons to deploy/web
+        run: cp client/pwa/icon*.png deploy/web/
+
+      - name: Add .nojekyll (stops GitHub Pages stripping files)
+        run: touch deploy/web/.nojekyll
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./deploy/web
+          force_orphan: true
+          commit_message: "Deploy ${{ github.sha }}"
+
+  docker:
+    name: Build Go server Docker image
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t fortune-reels-server:${{ github.sha }} -f Dockerfile .
+      - name: Verify image starts
+        run: |
+          docker run -d --name test -p 8080:8080 -e AUTH_SECRET=ci-test fortune-reels-server:${{ github.sha }}
+          sleep 2
+          curl -sf http://localhost:8080/v1/healthz
+          docker rm -f test

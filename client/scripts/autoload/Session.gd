@@ -44,7 +44,11 @@ func _ready() -> void:
 
 func default_server_url() -> String:
 	if OS.has_feature("web"):
-		# Served by the game server itself: same origin.
+		# Check for an injected override first (GitHub Pages pointing at a hosted server);
+		# fall back to same-origin (when the Go server also serves the HTML).
+		var override = str(JavaScriptBridge.eval("window.SLOTS_SERVER_URL || ''"))
+		if override != "" and override != "null" and override != "$SERVER_URL":
+			return override
 		return str(JavaScriptBridge.eval("window.location.origin"))
 	if OS.get_name() == "Android":
 		return "http://10.0.2.2:8080"  # emulator -> host loopback; real devices need the LAN IP

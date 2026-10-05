@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#150833">
+<title>Fortune Reels</title>
+<link rel="manifest" href="index.manifest.json">
+<link rel="apple-touch-icon" href="pwa/icon180.png">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { width:100%; height:100%; background:#0c0524; overflow:hidden; }
+#canvas-wrapper {
+  position:fixed; top:0; left:0; width:100%; height:100%;
+  display:flex; align-items:center; justify-content:center;
+}
+#canvas {
+  display:block;
+  /* Godot resizes this itself via canvas_resize_policy=2 */
+}
+#loading {
+  position:fixed; inset:0; background:#0c0524;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:18px; color:#ffcf4a; font-family:Georgia,serif; z-index:10;
+  transition:opacity .4s;
+}
+#loading h1 { font-size:clamp(24px,6vw,40px); }
+#loading p  { font-size:clamp(13px,3vw,17px); color:#b9a8e8; }
+#bar-track { width:260px; height:6px; background:#2c1068; border-radius:3px; }
+#bar        { height:6px; background:#ffcf4a; border-radius:3px; width:0%; transition:width .2s; }
+#status     { font-size:13px; color:#7a66bb; min-height:1.2em; }
+</style>
+</head>
+<body>
+<div id="loading">
+  <h1>Fortune Reels</h1>
+  <div id="bar-track"><div id="bar"></div></div>
+  <p id="status">Loading…</p>
+</div>
+<div id="canvas-wrapper">
+  <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+</div>
+<script>
+// SERVER_URL is injected by the deploy step (see scripts/deploy_web.sh).
+// When running locally (same-origin), leave it empty and the client
+// uses window.location.origin automatically (see Session.gd default_server_url).
+window.SLOTS_SERVER_URL = "$SERVER_URL";
+</script>
+$GODOT_HEAD
+<script>
+var bar = document.getElementById('bar');
+var status = document.getElementById('status');
+var loading = document.getElementById('loading');
+var prog = 0;
+$GODOT_SCRIPT
+</script>
+</body>
+</html>
