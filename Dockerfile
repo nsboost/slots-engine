@@ -13,6 +13,18 @@ WORKDIR /app
 COPY --from=build /server /app/server
 COPY migrations/ /app/migrations/
 
+# Only copy static assets if they were generated.
+RUN mkdir -p /app/web
+COPY . .
+RUN if [ -d /app/deploy/web ]; then cp -a /app/deploy/web/. /app/web/; fi
+
+EXPOSE 8080
+ENV LISTEN_ADDR=:8080 \
+    STATIC_DIR=/app/web \
+    AUTH_SECRET="" \
+    LEDGER_DSN="" \
+    TRUST_PROXY="true"
+
 # Copy web build if it exists at build time (CI copies it in before docker build).
 # When running without a web build, set STATIC_DIR to an empty string.
 COPY deploy/web/ /app/web/
