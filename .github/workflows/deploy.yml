@@ -121,7 +121,7 @@ jobs:
   docker:
     name: Build Go server Docker image
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, build-web]
     steps:
       - uses: actions/checkout@v4
       - name: Build image
