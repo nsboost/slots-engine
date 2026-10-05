@@ -118,14 +118,23 @@ jobs:
           force_orphan: true
           commit_message: "Deploy ${{ github.sha }}"
 
+  jobs:
   docker:
     name: Build Go server Docker image
     runs-on: ubuntu-latest
     needs: [test, build-web]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download web build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: web-build
+          path: deploy/web
+
       - name: Build image
         run: docker build -t fortune-reels-server:${{ github.sha }} -f Dockerfile .
+
       - name: Verify image starts
         run: |
           docker run -d --name test -p 8080:8080 -e AUTH_SECRET=ci-test fortune-reels-server:${{ github.sha }}
