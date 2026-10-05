@@ -104,8 +104,11 @@ jobs:
             echo "No SLOTS_SERVER_URL secret — client will use same-origin"
           fi
 
-     - name: Copy PWA icons to deploy/web
+      - name: Copy PWA icons to deploy/web
         run: cp client/pwa/icon*.png deploy/web/
+
+      - name: Add .nojekyll (stops GitHub Pages stripping files)
+        run: touch deploy/web/.nojekyll
 
       - name: Upload web build artifacts
         uses: actions/upload-artifact@v4
@@ -113,9 +116,6 @@ jobs:
           name: web-build
           path: deploy/web
           retention-days: 1
-
-      - name: Add .nojekyll (stops GitHub Pages stripping files)
-        run: touch deploy/web/.nojekyll
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
@@ -125,7 +125,6 @@ jobs:
           force_orphan: true
           commit_message: "Deploy ${{ github.sha }}"
 
-  jobs:
   docker:
     name: Build Go server Docker image
     runs-on: ubuntu-latest
