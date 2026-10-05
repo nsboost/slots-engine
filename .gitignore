@@ -21,3 +21,11 @@
 
 # Go build cache if ever vendored locally
 /vendor/
+
+# Godot
+client/.godot/
+client/.import/
+*.translation
+
+# Web build output (regenerate with scripts/build_web.sh)
+deploy/web/
