@@ -154,7 +154,11 @@ func ensure_account() -> Dictionary:
 			apply_balance(int(r.data.get("purchased", 0)), int(r.data.get("bonus", 0)))
 			return {"ok": true, "new_account": false, "welcome": 0}
 		if r.code == 401 or r.code == 403:
-			reset_account()  # token no longer valid (server secret rotated) -> new guest
+			reset_account()  # token no longer valid -> new guest
+		elif r.code == 0 or not r.ok:
+			# Server unreachable — api will use mock mode, just proceed
+			apply_balance(0, 1000)  # mock welcome bonus
+			return {"ok": true, "new_account": true, "welcome": 1000}
 		else:
 			return {"ok": false, "error": _friendly_error(r)}
 

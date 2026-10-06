@@ -1,16 +1,23 @@
 #!/bin/sh
-# Builds the Godot web client into deploy/web and pre-gzips the large
-# assets (the server serves the .gz copies to browsers that accept gzip:
-# the engine .wasm is ~35 MB raw, ~9 MB compressed).
-#
-# Requires: godot 4.4 on PATH and the Web export templates installed
-# (~/.local/share/godot/export_templates/4.4.stable/web_nothreads_*.zip).
+# Build the Godot web client and pre-gzip large assets.
+# Safe to run locally or in GitHub Actions.
 set -e
 cd "$(dirname "$0")/.."
-rm -rf deploy/web && mkdir -p deploy/web
-godot --headless --path client --import >/dev/null 2>&1 || true
+
+mkdir -p deploy/web client/pwa
+
+echo "==> Importing Godot project..."
+godot --headless --path client --import 2>&1 | grep -v "^$" | grep -v "progress_dialog" || true
+
+echo "==> Exporting to Web..."
 godot --headless --path client --export-release "Web" ../deploy/web/index.html
+
+echo "==> Pre-compressing assets..."
 for f in deploy/web/*.wasm deploy/web/*.js deploy/web/*.pck deploy/web/*.html deploy/web/*.json; do
-  [ -f "$f" ] && gzip -9 -k -f "$f"
+  [ -f "$f" ] || continue
+  gzip -9 -k -f "$f"
+  echo "  gzipped: $(basename $f)"
 done
-ls -la deploy/web
+
+echo "==> Done."
+ls -lh deploy/web/*.wasm 2>/dev/null || true

@@ -72,7 +72,11 @@ func _start() -> void:
 		_fail(str(cat.get("error", "Could not load games.")))
 		return
 
-	if bool(acc.get("new_account", false)):
+	var is_mock: bool = Session.api.is_mock()
+	if is_mock:
+		_status.text = "Running in demo mode (no server — full game works offline)"
+		await get_tree().create_timer(1.2).timeout
+	elif bool(acc.get("new_account", false)):
 		_status.text = "Welcome! +%s bonus coins credited." % UI.fmt(int(acc.get("welcome", 0)))
 		await get_tree().create_timer(0.9).timeout
 	_set_spinning(false)
